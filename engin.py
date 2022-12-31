@@ -12,7 +12,6 @@ from logger import get_logger
 import logging
 from multiprocessing import Pool
 from collections import namedtuple
-from numba import jit, njit
 
 logger = get_logger('main', logging.INFO)
 
@@ -22,6 +21,8 @@ NodeState = namedtuple('NodeState',
                            'force',
                            'position',
                            'speed',
+                           'mask',
+                           'collide'
                        ]
                        )
 
@@ -33,6 +34,7 @@ class Nodes:
         self.speed = np.zeros((N, 3))
         self.mess = np.zeros((N, 1))
         self.mask = np.ones((N, 1))
+        self.decay_accumulate=0
 
     @property
     def valid_map(self):
@@ -58,8 +60,7 @@ class Nodes:
         self.mess[slot] = mass
 
     @staticmethod
-    @njit
-    def _diff(pos)->np.ndarray:
+    def _diff(pos) -> np.ndarray:
         p1 = pos.reshape(pos.shape[0], 1, pos.shape[1])
         p2 = pos.reshape(1, pos.shape[0], pos.shape[1])
         d = p1-p2
@@ -78,7 +79,6 @@ class Nodes:
         return 100
 
     @staticmethod
-    @njit
     def _g_force(mess, pos, G, max_force):
         mm = mess.T * mess
         mm = mm.reshape((mm.shape[0], mm.shape[0], 1))
@@ -91,18 +91,17 @@ class Nodes:
         pos_diff = d
         pos_diff_Ousq = pos_diff[:, :, 0]**2 + \
             pos_diff[:, :, 1] ** 2 + pos_diff[:, :, 2] ** 2
-        pos_diff_Ousq=pos_diff_Ousq.reshape((
+        pos_diff_Ousq = pos_diff_Ousq.reshape((
             pos_diff_Ousq.shape[0],
             pos_diff_Ousq.shape[1],
             1
-            ))
+        ))
         pos_diff_Ou = np.sqrt(pos_diff_Ousq)
         pos_direction = pos_diff / pos_diff_Ou
         F = G * mm * pos_direction * (1/pos_diff_Ou) * (1/pos_diff_Ou)
         F = F.clip(-max_force, max_force)
         F = np.nansum(F, axis=0)
         return F
-
 
     @property
     def g_force(self):
@@ -136,10 +135,21 @@ class Nodes:
         np.fill_diagonal(pos_diff_Ou, self.r+1)
         collide = pos_diff_Ou > self.r
         collide = collide.min(axis=1, keepdims=True)
+        # logger.info(collide)
         g_force = self.g_force
         self.speed += g_force / self.mess * delta_t * self.mask
+        self.decay_accumulate += delta_t
+        if self.decay_accumulate > 0.1:
+            self.decay_accumulate = 0
+            self.speed = self.speed * self.speed_decay
         if with_state:
-            return NodeState(g_force, self.pos.copy(), self.speed.copy())
+            return NodeState(
+                g_force, 
+                self.pos.copy(), 
+                self.speed.copy(), 
+                self.mask.copy(),
+                collide,
+                )
 
 
 class Render:
@@ -167,8 +177,14 @@ class RenderCv:
         pos = nodes.position
         # logger.info(pos)
         # raise Exception()
-        pos = pos[:, :2]
-        plt.scatter(pos[:, 0], pos[:, 1], **self.plt_args)
+        selection = (nodes.mask[:, 0] == 1)
+        pos = pos[selection, :2]
+        collide = nodes.collide[selection, 0]
+        plt.scatter(
+            pos[:, 0], pos[:, 1],
+            c=collide.astype(np.int64),
+            **self.plt_args)
+        plt.colorbar()
         plt.xlim((-self.lim, self.lim))
         plt.ylim((-self.lim, self.lim))
         of = BytesIO()
@@ -183,7 +199,7 @@ class RenderCv:
 class Simulator(object):
     def __init__(self, nodes: Nodes = None) -> None:
         self.nodes: Nodes = nodes
-        self.render = RenderCv()
+        self.render = RenderCv(s=1)
         # self.render = Render(nodes)
 
     def render_frame(self, state: NodeState):
@@ -205,7 +221,7 @@ class Simulator(object):
             for i in range(sims_per_frame):
                 state = node.step(step, with_state=(i == sims_per_frame-1))
             pos_rec.append(state)
-
+        print('output...')
         if not output_name.endswith('.mp4'):
             output_name = output_name + '.mp4'
         result = WriteGear(
